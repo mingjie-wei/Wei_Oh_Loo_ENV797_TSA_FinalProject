@@ -17,6 +17,7 @@ library(lubridate)
 ```{r load-data}
 mida_raw <- read_excel("Region_MIDA.xlsx")
 tex_raw  <- read_excel("Region_TEX.xlsx")
+pjm_raw <- read_excel("PJM.xlsx")
 ```
 
 ```{r}
@@ -48,13 +49,125 @@ tex_clean <- tex_raw %>%
   ) %>%
   mutate(date = as_date(date)) %>%
   filter(!is.na(demand_mwh))
+
+pjm_clean <- pjm_raw %>%
+  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
+  rename(
+    date            = `Local date`,
+    hour            = Hour,
+    demand_mwh      = Demand,
+    demand_forecast = `Demand forecast`,
+    generation = `Net generation`
+  ) %>%
+  mutate(date = as_date(date)) %>%
+  filter(!is.na(demand_mwh))
 ```
 
 ```{r}
 (mida_clean)
 tex_clean
+pjm_clean
 ```
 
+```{r}
+mida_daily <- mida_clean %>%
+  group_by(date) %>%
+  summarise(
+    demand_daily   = sum(demand_mwh, na.rm = TRUE),
+    forecast_daily = sum(demand_forecast, na.rm = TRUE),
+    gen_daily      = sum(generation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+tex_daily <- tex_clean %>%
+  group_by(date) %>%
+  summarise(
+    demand_daily   = sum(demand_mwh, na.rm = TRUE),
+    forecast_daily = sum(demand_forecast, na.rm = TRUE),
+    gen_daily      = sum(generation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pjm_daily <- tex_clean %>%
+  group_by(date) %>%
+  summarise(
+    demand_daily   = sum(demand_mwh, na.rm = TRUE),
+    forecast_daily = sum(demand_forecast, na.rm = TRUE),
+    gen_daily      = sum(generation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+range(mida_daily$date)
+range(tex_daily$date)
+
+# Are there any gaps in the daily series?
+mida_daily %>%
+  mutate(gap = as.numeric(date - lag(date))) %>%
+  filter(gap > 1)
+```
+
+```{r}
+bind_rows(
+  pjm_daily %>% mutate(region = "PJM"),
+  tex_daily  %>% mutate(region = "TEX")
+) %>%
+  ggplot(aes(x = date, y = demand_daily, color = region)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(method = "loess", span = 0.1, se = FALSE) +
+  geom_vline(xintercept = as.Date("2022-11-01"),
+             linetype = "dashed", color = "black") +
+  annotate("text", x = as.Date("2022-11-01"),
+           y = Inf, label = "ChatGPT launch", 
+           hjust = -0.1, vjust = 1.5, size = 3) +
+  facet_wrap(~region, scales = "free_y", ncol = 1) +
+  labs(title = "Daily Electricity Demand",
+       x = NULL, y = "Daily Demand (MWh)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+
+```{r}
+bind_rows(
+  pjm_daily %>% mutate(region = "PJM"),
+  tex_daily  %>% mutate(region = "TEX")
+) %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(region, month) %>%
+  summarise(demand_monthly = mean(demand_daily), .groups = "drop") %>%
+  ggplot(aes(x = month, y = demand_monthly, color = region)) +
+  geom_line() +
+  geom_vline(xintercept = as.Date("2022-11-01"),
+             linetype = "dashed", color = "black") +
+  facet_wrap(~region, scales = "free_y", ncol = 1) +
+  labs(title = "Monthly Average Daily Demand",
+       x = NULL, y = "Avg Daily Demand (MWh)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+bind_rows(
+  pjm_daily %>% mutate(region = "PJM"),
+  tex_daily  %>% mutate(region = "TEX")
+) %>%
+  mutate(year = year(date), doy = yday(date)) %>%
+  filter(year >= 2018) %>%
+  mutate(recent = ifelse(year >= 2022, "2022+", "Pre-2022")) %>%
+  ggplot(aes(x = doy, y = demand_daily, 
+             color = factor(year),
+             alpha = recent,
+             group = factor(year))) +
+  geom_smooth(method = "loess", span = 0.2, se = FALSE) +
+  scale_alpha_manual(values = c("2022+" = 1, "Pre-2022" = 0.3)) +
+  facet_wrap(~region, scales = "free_y", ncol = 1) +
+  labs(title = "Demand by Day of Year, Colored by Year",
+       subtitle = "Post-2022 years should sit above earlier years if break exists",
+       x = "Day of Year", y = "Daily Demand (MWh)",
+       color = "Year", alpha = NULL) +
+  theme_minimal()
+
+
+```
 
 
 
