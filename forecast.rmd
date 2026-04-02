@@ -1,0 +1,64 @@
+---
+title: "AI Data Centers and Power Grid Load Shifts"
+author: "Mingie Wei, Si Min Loo, Seohyun Oh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+```
+
+```{r load-data}
+mida_raw <- read_excel("Region_MIDA.xlsx")
+tex_raw  <- read_excel("Region_TEX.xlsx")
+```
+
+```{r}
+glimpse(mida_raw)
+```
+
+
+```{r}
+mida_clean <- mida_raw %>%
+  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
+  rename(
+    date            = `Local date`,
+    hour            = Hour,
+    demand_mwh      = Demand,
+    demand_forecast = `Demand forecast`,
+    generation = `Net generation`
+  ) %>%
+  mutate(date = as_date(date)) %>%
+  filter(!is.na(demand_mwh))
+
+tex_clean <- tex_raw %>%
+  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
+  rename(
+    date            = `Local date`,
+    hour            = Hour,
+    demand_mwh      = Demand,
+    demand_forecast = `Demand forecast`,
+    generation = `Net generation`
+  ) %>%
+  mutate(date = as_date(date)) %>%
+  filter(!is.na(demand_mwh))
+```
+
+```{r}
+(mida_clean)
+tex_clean
+```
+
+
+
+
+
+
+
+
