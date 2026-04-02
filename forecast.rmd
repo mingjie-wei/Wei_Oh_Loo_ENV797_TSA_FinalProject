@@ -4,6 +4,8 @@ author: "Mingie Wei, Si Min Loo, Seohyun Oh"
 date: "`r Sys.Date()`"
 output: html_document
 ---
+
+# Loading
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
@@ -15,29 +17,12 @@ library(lubridate)
 ```
 
 ```{r load-data}
-mida_raw <- read_excel("Region_MIDA.xlsx")
 tex_raw  <- read_excel("Region_TEX.xlsx")
 pjm_raw <- read_excel("PJM.xlsx")
 ```
 
+# Cleaning them, keeping only demand, demand forecasted, and generation
 ```{r}
-glimpse(mida_raw)
-```
-
-
-```{r}
-mida_clean <- mida_raw %>%
-  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
-  rename(
-    date            = `Local date`,
-    hour            = Hour,
-    demand_mwh      = Demand,
-    demand_forecast = `Demand forecast`,
-    generation = `Net generation`
-  ) %>%
-  mutate(date = as_date(date)) %>%
-  filter(!is.na(demand_mwh))
-
 tex_clean <- tex_raw %>%
   select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
   rename(
@@ -64,21 +49,11 @@ pjm_clean <- pjm_raw %>%
 ```
 
 ```{r}
-(mida_clean)
 tex_clean
 pjm_clean
 ```
-
+# aggregate to daily data
 ```{r}
-mida_daily <- mida_clean %>%
-  group_by(date) %>%
-  summarise(
-    demand_daily   = sum(demand_mwh, na.rm = TRUE),
-    forecast_daily = sum(demand_forecast, na.rm = TRUE),
-    gen_daily      = sum(generation, na.rm = TRUE),
-    .groups = "drop"
-  )
-
 tex_daily <- tex_clean %>%
   group_by(date) %>%
   summarise(
@@ -97,15 +72,19 @@ pjm_daily <- tex_clean %>%
     .groups = "drop"
   )
 
-range(mida_daily$date)
+range(pjm_daily$date)
 range(tex_daily$date)
 
 # Are there any gaps in the daily series?
-mida_daily %>%
+tex_daily %>%
+  mutate(gap = as.numeric(date - lag(date))) %>%
+  filter(gap > 1)
+pjm_daily %>%
   mutate(gap = as.numeric(date - lag(date))) %>%
   filter(gap > 1)
 ```
 
+# Initial Exploratory plots
 ```{r}
 bind_rows(
   pjm_daily %>% mutate(region = "PJM"),
@@ -125,8 +104,6 @@ bind_rows(
   theme_minimal() +
   theme(legend.position = "none")
 ```
-
-
 
 ```{r}
 bind_rows(
@@ -168,6 +145,54 @@ bind_rows(
 
 
 ```
+
+
+# PACF/ACF plots and STL Decomposition
+
+```{r}
+library(forecast)
+
+# Check autocorrelation structure
+par(mfrow = c(2,2))
+acf(pjm_daily$demand_daily, lag.max = 365, main = "ACF - PJM")
+pacf(pjm_daily$demand_daily, lag.max = 365, main = "PACF - PJM")
+acf(tex_daily$demand_daily, lag.max = 365, main = "ACF - TEX")
+pacf(tex_daily$demand_daily, lag.max = 365, main = "PACF - TEX")
+
+
+pjm_ts <- ts(pjm_daily$demand_daily, 
+             start = c(2016, 1), 
+             frequency = 365)
+
+tex_ts <- ts(tex_daily$demand_daily,
+             start = c(2016, 1),
+             frequency = 365)
+
+pjm_stl <- stl(pjm_ts, s.window = "periodic", robust = TRUE)
+tex_stl <- stl(tex_ts, s.window = "periodic", robust = TRUE)
+
+plot(pjm_stl, main = "STL Decomposition - PJM")
+plot(tex_stl, main = "STL Decomposition - TEX")
+
+```
+
+ACF for both show a U shape - the series is non stationary and has strong annual seasonality. Both regions look almost identical.
+
+Trend component for both show a relatively flat trend 2016-2020, and then acceleration starting around 2022. Seasonality looks stable and consistent. 
+
+## To do after this
+
+# Maybe get weather data from NOAA and merge with the above
+
+# Train test split
+
+# Baseline Modeling. Can try STL + Arima, Fourier, TBATS, some state space models?
+
+# Do something about the structural break, maybe refit model after 2022 or something
+
+# Metrics
+
+# Compare across regions?
 
 
 
