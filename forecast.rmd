@@ -236,11 +236,161 @@ tex_final <- tex_final %>%
 
 # Train test split
 
+```{r}
+# Hold out the last 365 days (~1 year) as a test set.
+
+split_date <- max(tex_final$date) - 365
+
+tex_train <- tex_final %>% filter(date <= split_date)
+tex_test  <- tex_final %>% filter(date >  split_date)
+
+pjm_train <- pjm_final %>% filter(date <= split_date)
+pjm_test  <- pjm_final %>% filter(date >  split_date)
+
+library(forecast)
+
+# Convert training series to ts (frequency = 365 approximates daily seasonality)
+tex_train_ts <- ts(tex_train$demand_daily,
+                   start     = c(year(min(tex_train$date)), yday(min(tex_train$date))),
+                   frequency = 365)
+
+pjm_train_ts <- ts(pjm_train$demand_daily,
+                   start     = c(year(min(pjm_train$date)), yday(min(pjm_train$date))),
+                   frequency = 365)
+
+h <- nrow(tex_test)   # forecast horizon = length of test set
+
+```
+
 # Baseline Modeling. Can try STL + Arima, Fourier, TBATS, some state space models?
+
+```{r}
+# Reusable accuracy table builder
+acc_table <- function(fc, actual, model_name, region) {
+  e   <- actual - fc
+  mae <- mean(abs(e))
+  rmse <- sqrt(mean(e^2))
+  mape <- mean(abs(e / actual)) * 100
+  data.frame(region = region, model = model_name,
+             MAE = round(mae, 0), RMSE = round(rmse, 0), MAPE = round(mape, 2))
+}
+
+#Model 1: SNaive
+snaive_tex <- snaive(tex_train_ts, h = h)
+snaive_pjm <- snaive(pjm_train_ts, h = h)
+acc_snaive_tex <- acc_table(as.numeric(snaive_tex$mean), tex_test$demand_daily, "SNaive", "TEX")
+acc_snaive_pjm <- acc_table(as.numeric(snaive_pjm$mean), pjm_test$demand_daily, "SNaive", "PJM")
+
+# model 2 stl + ets
+stlf_tex <- stlf(tex_train_ts, h = h, method = "ets", robust = TRUE)
+stlf_pjm <- stlf(pjm_train_ts, h = h, method = "ets", robust = TRUE)
+
+acc_stlf_tex <- acc_table(as.numeric(stlf_tex$mean), tex_test$demand_daily, "STL+ETS", "TEX")
+acc_stlf_pjm <- acc_table(as.numeric(stlf_pjm$mean), pjm_test$demand_daily, "STL+ETS", "PJM")
+
+# STL + ARIMA
+stlfarima_tex <- stlf(tex_train_ts, h = h, method = "arima", robust = TRUE)
+stlfarima_pjm <- stlf(pjm_train_ts, h = h, method = "arima", robust = TRUE)
+acc_stlfarima_tex <- acc_table(as.numeric(stlfarima_tex$mean), tex_test$demand_daily, "STL+ARIMA", "TEX")
+acc_stlfarima_pjm <- acc_table(as.numeric(stlfarima_pjm$mean), pjm_test$demand_daily, "STL+ARIMA", "PJM")
+
+# Fourier + ARIMA
+K_tex <- 10   # initial, can do grid search later
+K_pjm <- 10 # initial, can do grid search later
+
+fourier_tex_train <- fourier(tex_train_ts, K = K_tex)
+fourier_tex_test  <- fourier(tex_train_ts, K = K_tex, h = h)
+
+fourier_pjm_train <- fourier(pjm_train_ts, K = K_pjm)
+fourier_pjm_test  <- fourier(pjm_train_ts, K = K_pjm, h = h)
+
+arima_fourier_tex <- auto.arima(tex_train_ts,
+                                xreg        = fourier_tex_train,
+                                seasonal    = FALSE,
+                                stepwise    = TRUE,
+                                approximation = TRUE)
+
+arima_fourier_pjm <- auto.arima(pjm_train_ts,
+                                xreg        = fourier_pjm_train,
+                                seasonal    = FALSE,
+                                stepwise    = TRUE,
+                                approximation = TRUE)
+
+fc_fourier_tex <- forecast(arima_fourier_tex, xreg = fourier_tex_test, h = h)
+fc_fourier_pjm <- forecast(arima_fourier_pjm, xreg = fourier_pjm_test, h = h)
+
+acc_fourier_tex <- acc_table(as.numeric(fc_fourier_tex$mean), tex_test$demand_daily, "Fourier+ARIMA", "TEX")
+acc_fourier_pjm <- acc_table(as.numeric(fc_fourier_pjm$mean), pjm_test$demand_daily, "Fourier+ARIMA", "PJM")
+
+# TBATS
+tbats_tex <- tbats(tex_train_ts)
+tbats_pjm <- tbats(pjm_train_ts)
+
+fc_tbats_tex <- forecast(tbats_tex, h = h)
+fc_tbats_pjm <- forecast(tbats_pjm, h = h)
+
+acc_tbats_tex <- acc_table(as.numeric(fc_tbats_tex$mean), tex_test$demand_daily, "TBATS", "TEX")
+acc_tbats_pjm <- acc_table(as.numeric(fc_tbats_pjm$mean), pjm_test$demand_daily, "TBATS", "PJM")
+
+```
 
 # Do something about the structural break, maybe refit model after 2022 or something
 
 # Metrics
+
+```{r}
+# Reusable accuracy table builder
+
+results <- bind_rows(
+  acc_snaive_tex,    acc_snaive_pjm,
+  acc_stlf_tex,      acc_stlf_pjm,
+  acc_stlfarima_tex, acc_stlfarima_pjm,
+  acc_fourier_tex,   acc_fourier_pjm,
+  acc_tbats_tex,     acc_tbats_pjm
+) %>%
+  arrange(region, MAPE)
+
+print(results)
+```
+
+```{r}
+best_fc_tex <- stlfarima_tex   # ← update after comparing results
+
+tibble(
+  date     = tex_test$date,
+  actual   = tex_test$demand_daily,
+  forecast = as.numeric(best_fc_tex$mean),
+  lo80     = as.numeric(best_fc_tex$lower[, 1]),
+  hi80     = as.numeric(best_fc_tex$upper[, 1])
+) %>%
+  ggplot(aes(x = date)) +
+  geom_ribbon(aes(ymin = lo80, ymax = hi80), fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(y = actual),   color = "black", linewidth = 0.7) +
+  geom_line(aes(y = forecast), color = "steelblue", linewidth = 0.7) +
+  labs(title  = "TEX – Best Model: Actual vs Forecast (Test Period)",
+       subtitle = "Black = actual | Blue = forecast | Shaded = 80% CI",
+       x = NULL, y = "Daily Demand (MWh)") +
+  theme_minimal()
+
+best_fc_pjm <- stlfarima_pjm   # ← update after comparing results
+
+tibble(
+  date     = pjm_test$date,
+  actual   = pjm_test$demand_daily,
+  forecast = as.numeric(best_fc_pjm$mean),
+  lo80     = as.numeric(best_fc_pjm$lower[, 1]),
+  hi80     = as.numeric(best_fc_pjm$upper[, 1])
+) %>%
+  ggplot(aes(x = date)) +
+  geom_ribbon(aes(ymin = lo80, ymax = hi80), fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(y = actual),   color = "black", linewidth = 0.7) +
+  geom_line(aes(y = forecast), color = "steelblue", linewidth = 0.7) +
+  labs(title  = "PJM – Best Model: Actual vs Forecast (Test Period)",
+       subtitle = "Black = actual | Blue = forecast | Shaded = 80% CI",
+       x = NULL, y = "Daily Demand (MWh)") +
+  theme_minimal()
+
+```
 
 # Compare across regions?
 
