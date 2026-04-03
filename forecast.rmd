@@ -14,17 +14,22 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 library(tidyverse)
 library(readxl)
 library(lubridate)
+library(dplyr)
 ```
 
 ```{r load-data}
 tex_raw  <- read_excel("Region_TEX.xlsx")
 pjm_raw <- read_excel("PJM.xlsx")
+
+tex_weather <- read_csv("TEX_Weather.csv")
+pjm_weather <- read_csv("PJM_Weather.csv")
 ```
 
 # Cleaning them, keeping only demand, demand forecasted, and generation
 ```{r}
+
 tex_clean <- tex_raw %>%
-  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
+  select(`Local date`, Hour, `Demand forecast`, Demand, `Demand forecast`, `Net generation`) %>%
   rename(
     date            = `Local date`,
     hour            = Hour,
@@ -36,13 +41,14 @@ tex_clean <- tex_raw %>%
   filter(!is.na(demand_mwh))
 
 pjm_clean <- pjm_raw %>%
-  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
+  # Used Adjusted demand, Adjusted net generation for PJM 
+  select(`Local date`, Hour, `Demand forecast`, `Adjusted demand`, `Demand forecast`, `Adjusted net generation`) %>%
   rename(
     date            = `Local date`,
     hour            = Hour,
-    demand_mwh      = Demand,
+    demand_mwh      = `Adjusted demand`,
     demand_forecast = `Demand forecast`,
-    generation = `Net generation`
+    generation = `Adjusted net generation`
   ) %>%
   mutate(date = as_date(date)) %>%
   filter(!is.na(demand_mwh))
@@ -52,6 +58,8 @@ pjm_clean <- pjm_raw %>%
 tex_clean
 pjm_clean
 ```
+
+
 # aggregate to daily data
 ```{r}
 tex_daily <- tex_clean %>%
@@ -63,7 +71,7 @@ tex_daily <- tex_clean %>%
     .groups = "drop"
   )
 
-pjm_daily <- tex_clean %>%
+pjm_daily <- pjm_clean %>%
   group_by(date) %>%
   summarise(
     demand_daily   = sum(demand_mwh, na.rm = TRUE),
@@ -146,7 +154,6 @@ bind_rows(
 
 ```
 
-
 # PACF/ACF plots and STL Decomposition
 
 ```{r}
@@ -175,14 +182,57 @@ plot(pjm_stl, main = "STL Decomposition - PJM")
 plot(tex_stl, main = "STL Decomposition - TEX")
 
 ```
+PJM: ACF shows a clear cyclic pattern with a 365-day lag, indicating strong annual seasonality.
 
-ACF for both show a U shape - the series is non stationary and has strong annual seasonality. Both regions look almost identical.
+TEX: The ACF displays a "U-shaped" decay, which is a classic symptom of a non-stationary series with a strong upward trend. This suggests that the mean demand is increasing over time, likely due to population growth and industrial expansion
 
-Trend component for both show a relatively flat trend 2016-2020, and then acceleration starting around 2022. Seasonality looks stable and consistent. 
+# Merge Weather data from NOAA
 
-## To do after this
+```{r}
+weather <- bind_rows(
+  pjm_weather %>% mutate(region = "PJM"),
+  tex_weather %>% mutate(region = "TEX")
+) %>%
+  mutate(
+    DATE = as.Date(DATE),
+    tavg = (TMAX + TMIN) / 2,
+    cdd = pmax(tavg - 65, 0),
+    hdd = pmax(65 - tavg, 0)
+  )
 
-# Maybe get weather data from NOAA and merge with the above
+weather_daily <- weather %>%
+  group_by(DATE, region) %>%
+  summarise(
+    tavg = mean(tavg, na.rm = TRUE),
+    cdd  = mean(cdd, na.rm = TRUE),
+    hdd  = mean(hdd, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pjm_final <- pjm_daily %>%
+  mutate(date = as.Date(date)) %>%
+  left_join(
+    weather_daily %>%
+      filter(region == "PJM") %>%
+      select(-region),
+    by = c("date" = "DATE")
+  )
+
+tex_final <- tex_daily %>%
+  mutate(date = as.Date(date)) %>%
+  left_join(
+    weather_daily %>%
+      filter(region == "TEX") %>%
+      select(-region),
+    by = c("date" = "DATE")
+  )
+
+pjm_final <- pjm_final %>%
+  filter(!is.na(tavg), !is.na(cdd), !is.na(hdd))
+
+tex_final <- tex_final %>%
+  filter(!is.na(tavg), !is.na(cdd), !is.na(hdd))
+```
 
 # Train test split
 
