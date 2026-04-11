@@ -15,14 +15,17 @@ library(tidyverse)
 library(readxl)
 library(lubridate)
 library(dplyr)
+library(forecast)
 ```
 
 ```{r load-data}
 tex_raw  <- read_excel("Region_TEX.xlsx")
 pjm_raw <- read_excel("PJM.xlsx")
+miso_raw <- read_excel("MISO.xlsx")
 
 tex_weather <- read_csv("TEX_Weather.csv")
 pjm_weather <- read_csv("PJM_Weather.csv")
+miso_weather <- read_csv("MISO_Weather.csv")
 ```
 
 # Cleaning them, keeping only demand, demand forecasted, and generation
@@ -52,11 +55,25 @@ pjm_clean <- pjm_raw %>%
   ) %>%
   mutate(date = as_date(date)) %>%
   filter(!is.na(demand_mwh))
+
+miso_clean <- miso_raw %>%
+  # Used Adjusted demand, Adjusted net generation for PJM 
+  select(`Local date`, Hour, `Demand forecast`, `Adjusted demand`, `Demand forecast`, `Adjusted net generation`) %>%
+  rename(
+    date            = `Local date`,
+    hour            = Hour,
+    demand_mwh      = `Adjusted demand`,
+    demand_forecast = `Demand forecast`,
+    generation = `Adjusted net generation`
+  ) %>%
+  mutate(date = as_date(date)) %>%
+  filter(!is.na(demand_mwh))
 ```
 
 ```{r}
 tex_clean
 pjm_clean
+miso_clean
 ```
 
 
@@ -80,14 +97,27 @@ pjm_daily <- pjm_clean %>%
     .groups = "drop"
   )
 
+miso_daily <- miso_clean %>%
+  group_by(date) %>%
+  summarise(
+    demand_daily   = sum(demand_mwh, na.rm = TRUE),
+    forecast_daily = sum(demand_forecast, na.rm = TRUE),
+    gen_daily      = sum(generation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
 range(pjm_daily$date)
 range(tex_daily$date)
+range(miso_daily$date)
 
 # Are there any gaps in the daily series?
 tex_daily %>%
   mutate(gap = as.numeric(date - lag(date))) %>%
   filter(gap > 1)
 pjm_daily %>%
+  mutate(gap = as.numeric(date - lag(date))) %>%
+  filter(gap > 1)
+miso_daily %>%
   mutate(gap = as.numeric(date - lag(date))) %>%
   filter(gap > 1)
 ```
@@ -157,8 +187,6 @@ bind_rows(
 # PACF/ACF plots and STL Decomposition
 
 ```{r}
-library(forecast)
-
 # Check autocorrelation structure
 par(mfrow = c(2,2))
 acf(pjm_daily$demand_daily, lag.max = 365, main = "ACF - PJM")
@@ -191,7 +219,8 @@ TEX: The ACF displays a "U-shaped" decay, which is a classic symptom of a non-st
 ```{r}
 weather <- bind_rows(
   pjm_weather %>% mutate(region = "PJM"),
-  tex_weather %>% mutate(region = "TEX")
+  tex_weather %>% mutate(region = "TEX"),
+  miso_weather %>% mutate(region = "MISO")
 ) %>%
   mutate(
     DATE = as.Date(DATE),
@@ -227,10 +256,22 @@ tex_final <- tex_daily %>%
     by = c("date" = "DATE")
   )
 
+miso_final <- miso_daily %>%
+  mutate(date = as.Date(date)) %>%
+  left_join(
+    weather_daily %>%
+      filter(region == "MISO") %>%
+      select(-region),
+    by = c("date" = "DATE")
+  )
+
 pjm_final <- pjm_final %>%
   filter(!is.na(tavg), !is.na(cdd), !is.na(hdd))
 
 tex_final <- tex_final %>%
+  filter(!is.na(tavg), !is.na(cdd), !is.na(hdd))
+
+miso_final <- miso_final %>%
   filter(!is.na(tavg), !is.na(cdd), !is.na(hdd))
 ```
 
@@ -246,8 +287,6 @@ tex_test  <- tex_final %>% filter(date >  split_date)
 
 pjm_train <- pjm_final %>% filter(date <= split_date)
 pjm_test  <- pjm_final %>% filter(date >  split_date)
-
-library(forecast)
 
 # Convert training series to ts (frequency = 365 approximates daily seasonality)
 tex_train_ts <- ts(tex_train$demand_daily,
@@ -281,7 +320,7 @@ snaive_pjm <- snaive(pjm_train_ts, h = h)
 acc_snaive_tex <- acc_table(as.numeric(snaive_tex$mean), tex_test$demand_daily, "SNaive", "TEX")
 acc_snaive_pjm <- acc_table(as.numeric(snaive_pjm$mean), pjm_test$demand_daily, "SNaive", "PJM")
 
-# model 2 stl + ets
+# model 2: STL + ETS
 stlf_tex <- stlf(tex_train_ts, h = h, method = "ets", robust = TRUE)
 stlf_pjm <- stlf(pjm_train_ts, h = h, method = "ets", robust = TRUE)
 
@@ -334,8 +373,6 @@ acc_tbats_pjm <- acc_table(as.numeric(fc_tbats_pjm$mean), pjm_test$demand_daily,
 
 ```
 
-# Do something about the structural break, maybe refit model after 2022 or something
-
 # Metrics
 
 ```{r}
@@ -352,6 +389,7 @@ results <- bind_rows(
 
 print(results)
 ```
+# Plots 
 
 ```{r}
 best_fc_tex <- stlfarima_tex   # ← update after comparing results
@@ -391,8 +429,223 @@ tibble(
   theme_minimal()
 
 ```
+# Deep Dive: Fourier + ARIMA with Weather Regressors
 
-# Compare across regions?
+```{r}
+run_demand_experiment <- function(full_data, train_cutoff, test_start, test_end, region_name, K_val = 5) {
+  
+  all_df <- full_data %>%
+    arrange(date) %>%
+    mutate(
+      cdd_lag1 = lag(cdd, 1),
+      hdd_lag1 = lag(hdd, 1),
+      cdd_sq = cdd^2
+    ) 
+  
+  train_df <- all_df %>%
+  filter(date <= train_cutoff) %>%
+  filter(complete.cases(cdd, hdd, cdd_lag1, hdd_lag1, cdd_sq, demand_daily))
+
+  test_df <- all_df %>%
+  filter(date >= test_start & date <= test_end) %>%
+  filter(complete.cases(cdd, hdd, cdd_lag1, hdd_lag1, cdd_sq, demand_daily))
+  
+  weather_vars <- c("cdd", "hdd", "cdd_lag1", "hdd_lag1", "cdd_sq")
+  
+  train_x_raw <- as.matrix(train_df[, weather_vars])
+  test_x_raw  <- as.matrix(test_df[, weather_vars])
+  
+  train_scaled <- scale(train_x_raw)
+  test_scaled  <- scale(test_x_raw, 
+                        center = attr(train_scaled, "scaled:center"), 
+                        scale  = attr(train_scaled, "scaled:scale"))
+  
+  train_ts <- ts(train_df$demand_daily, frequency = 365.25)
+  f_train  <- fourier(train_ts, K = K_val)
+  f_test   <- fourier(train_ts, K = K_val, h = nrow(test_df))
+  
+  fit <- auto.arima(
+    train_ts, 
+    xreg = cbind(f_train, train_scaled), 
+    seasonal = FALSE, stepwise = TRUE, approximation = FALSE
+  )
+  
+  fc <- forecast(fit, xreg = cbind(f_test, test_scaled))
+  
+  res_table <- acc_table(
+    as.numeric(fc$mean), 
+    test_df$demand_daily, 
+    paste0("Fourier+ARIMA+Weather (", year(train_cutoff-1),")"),
+    region_name
+  )
+  
+  return(list(table = res_table, model = fit, data = test_df %>% mutate(pred = as.numeric(fc$mean))))
+}
+
+tex_split_modern <- max(tex_final$date) - 365
+pjm_split_modern <- max(pjm_final$date) - 365
+
+tex_modern <- run_demand_experiment(
+  full_data    = tex_final, 
+  train_cutoff = tex_split_modern,        
+  test_start   = tex_split_modern + 1,        
+  test_end     = max(tex_final$date),        
+  region_name  = "TEX"
+)
+
+pjm_modern <- run_demand_experiment(
+  full_data    = pjm_final, 
+  train_cutoff = pjm_split_modern, 
+  test_start   = pjm_split_modern + 1, 
+  test_end     = max(pjm_final$date), 
+  region_name  = "PJM"
+)
+
+modern_results <- bind_rows(pjm_modern$table, tex_modern$table)
+print(modern_results)
+
+```
+
+Both PJM and TEX significantly improved MAPE after controlling for weather
+
+# Compare Modern (Trained pre-2025) vs Frozen (Trained pre-2022)
+
+```{r}
+
+cutoff_2022 <- as.Date("2022-11-01")
+
+tex_modern <- run_demand_experiment(tex_final, tex_split_modern, tex_split_modern + 1, max(tex_final$date), "TEX")
+pjm_modern <- run_demand_experiment(pjm_final, pjm_split_modern, pjm_split_modern + 1, max(pjm_final$date), "PJM")
+
+tex_frozen <- run_demand_experiment(tex_final, cutoff_2022, tex_split_modern + 1, max(tex_final$date), "TEX")
+pjm_frozen <- run_demand_experiment(pjm_final, cutoff_2022, pjm_split_modern + 1, max(pjm_final$date), "PJM")
+
+final_comparison_table <- bind_rows(
+  pjm_modern$table, tex_modern$table,
+  pjm_frozen$table, tex_frozen$table
+)
+
+print(final_comparison_table)
+```
+The fact that the Frozen model (pre-2022) performs significantly worse, despite controlling for weather, proves that the historical relationship between weather and demand has been broken by a structural shift that didn't exist in 2022.
+
+# Residual check to see the structural break
+
+```{r}
+checkresiduals(tex_modern$model)
+checkresiduals(pjm_modern$model)
+```
+The Ljung-Box test (p-value < 2.2e-16) indicates that the residuals are not white noise, suggesting remaining autocorrelation not captured by the model. This persistent autocorrelation implies that important drivers of electricity demand beyond weather and seasonality—such as economic activity or infrastructure expansion—are not fully captured.
+
+```{r}
+comparison_data <- bind_rows(
+  tex_modern$data %>% mutate(model_type = "Modern (Trained until 2025)", region = "TEX"),
+  tex_frozen$data %>% mutate(model_type = "Frozen (Trained until 2022)", region = "TEX"),
+  pjm_modern$data %>% mutate(model_type = "Modern (Trained until 2025)", region = "PJM"),
+  pjm_frozen$data %>% mutate(model_type = "Frozen (Trained until 2022)", region = "PJM")
+) %>%
+  mutate(residual = demand_daily - pred)
+
+ggplot(comparison_data, aes(x = residual, fill = model_type)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~region, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residual Density: Modern vs Frozen",
+       subtitle = "A right-shift in Frozen model indicates persistent under-prediction due to structural change",
+       x = "Residual (Actual - Predicted, MWh)", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplot(comparison_data, aes(x = date, y = residual, color = model_type)) +
+  geom_smooth(method = "gam", se = TRUE) + 
+  facet_wrap(~region, scales = "free_y") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residual Trend Over Time (2025-2026)",
+       subtitle = "The gap between Actual and Frozen-model predictions represents the 'New Demand'",
+       x = "Date", y = "Residual (MWh)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+The massive, persistent right-shift in the Frozen model's residuals, especially in the TEX region—provides empirical evidence of a structural break. This confirms that a new baseline of electricity demand has emerged post-2022 that weather and seasonality alone can no longer explain.
+
+# Compare across regions (MISO vs TEX)
+
+```{r}
+# Check autocorrelation structure
+par(mfrow = c(1,2))
+acf(miso_daily$demand_daily, lag.max = 365, main = "ACF - MISO")
+pacf(miso_daily$demand_daily, lag.max = 365, main = "PACF - MISO")
+
+
+miso_ts <- ts(miso_daily$demand_daily, 
+             start = c(2016, 1), 
+             frequency = 365)
+
+miso_stl <- stl(miso_ts, s.window = "periodic", robust = TRUE)
+
+plot(miso_stl, main = "STL Decomposition - MISO")
+```
+MISO: ACF shows a clear cyclic pattern with a 365-day lag, indicating strong annual seasonality.
+
+```{r}
+miso_split_modern <- max(miso_final$date) - 365
+
+miso_modern <- run_demand_experiment(
+  full_data    = miso_final, 
+  train_cutoff = miso_split_modern,        
+  test_start   = miso_split_modern + 1,        
+  test_end     = max(miso_final$date),        
+  region_name  = "MISO"
+)
+
+miso_frozen <- run_demand_experiment(miso_final, cutoff_2022, miso_split_modern + 1, max(miso_final$date), "MISO")
+
+final_comparison_table_miso <- bind_rows(
+  miso_modern$table, miso_frozen$table,
+)
+
+print(final_comparison_table_miso)
+```
+
+```{r}
+checkresiduals(miso_modern$model)
+```
+```{r}
+comparison_data2 <- bind_rows(
+  tex_modern$data %>% mutate(model_type = "Modern (Trained until 2025)", region = "TEX"),
+  tex_frozen$data %>% mutate(model_type = "Frozen (Trained until 2022)", region = "TEX"),
+  miso_modern$data %>% mutate(model_type = "Modern (Trained until 2025)", region = "MISO"),
+  miso_frozen$data %>% mutate(model_type = "Frozen (Trained until 2022)", region = "MISO")
+) %>%
+  mutate(residual = demand_daily - pred)
+
+ggplot(comparison_data2, aes(x = residual, fill = model_type)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~region, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residual Density: Modern vs Frozen",
+       subtitle = "A right-shift in Frozen model indicates persistent under-prediction due to structural change",
+       x = "Residual (Actual - Predicted, MWh)", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplot(comparison_data2, aes(x = date, y = residual, color = model_type)) +
+  geom_smooth(method = "gam", se = TRUE) + 
+  facet_wrap(~region, scales = "free_y") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residual Trend Over Time (2025-2026)",
+       subtitle = "The gap between Actual and Frozen-model predictions represents the 'New Demand'",
+       x = "Date", y = "Residual (MWh)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+There is no strong evidence of a persistent increase in demand in MISO; instead, the changes appear to be temporal and seasonal in nature. In contrast, TEX exhibits a systematic upward shift in residuals, indicating a persistent increase in baseline demand. 
+
+
+
+
+
+
 
 
 
