@@ -19,13 +19,13 @@ library(forecast)
 ```
 
 ```{r load-data}
-tex_raw  <- read_excel("Region_TEX.xlsx")
-pjm_raw <- read_excel("PJM.xlsx")
-miso_raw <- read_excel("MISO.xlsx")
+tex_raw  <- read_excel("data/Region_TEX.xlsx")
+pjm_raw <- read_excel("data/PJM.xlsx")
+miso_raw <- read_excel("data/MISO.xlsx")
 
-tex_weather <- read_csv("TEX_Weather.csv")
-pjm_weather <- read_csv("PJM_Weather.csv")
-miso_weather <- read_csv("MISO_Weather.csv")
+tex_weather <- read_csv("data/TEX_Weather.csv")
+pjm_weather <- read_csv("data/PJM_Weather.csv")
+miso_weather <- read_csv("data/MISO_Weather.csv")
 ```
 
 # Cleaning them, keeping only demand, demand forecasted, and generation
