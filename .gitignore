@@ -32,6 +32,12 @@ vignettes/*.pdf
 *_cache/
 /cache/
 
+# knitr intermediate output directories
+*_files/
+
+# Generated plot output (reproducible from scripts)
+/output/
+
 # Temporary files created by R markdown
 *.utf8.md
 *.knit.md

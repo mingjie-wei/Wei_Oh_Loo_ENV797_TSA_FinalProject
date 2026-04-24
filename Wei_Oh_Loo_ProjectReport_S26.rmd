@@ -1,0 +1,1153 @@
+---
+title: "AI Data Centers and Power Grid Load Shifts: Detecting Structural Breaks in U.S. Regional Electricity Demand"
+subtitle: "ENV 797 – Time Series Analysis for Energy and Environment Applications"
+author: "Si Min Loo, Mingjie Wei, Seohyun Oh"
+date: "Spring 2026"
+output:
+  pdf_document:
+    number_sections: true
+    toc: true
+    toc_depth: 2
+    latex_engine: xelatex
+geometry: margin=2.54cm
+header-includes:
+  - \usepackage{caption}
+  - \usepackage{array}
+  - \captionsetup[figure]{justification=raggedright,singlelinecheck=false}
+  - \captionsetup[table]{justification=raggedright,singlelinecheck=false,width=\textwidth}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4,
+  fig.pos   = "H"
+)
+
+set.seed(797)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(lubridate)
+  library(forecast)
+  library(knitr)
+  library(kableExtra)
+  library(strucchange)
+  library(scales)
+})
+
+CHATGPT_DATE   <- as.Date("2022-11-01")
+COL_TEX        <- "#E07B39"
+COL_MISO       <- "#3A7DC9"
+TABLE_FONT_SIZE <- 8
+PLOT_BASE_SIZE  <- 11
+
+theme_rep <- function() {
+  theme_minimal(base_size = PLOT_BASE_SIZE) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 12),
+      plot.subtitle    = element_text(color = "grey40", size = 10),
+      axis.title       = element_text(size = 11),
+      axis.text        = element_text(size = 10),
+      strip.text       = element_text(face = "bold", size = 10.5),
+      legend.text      = element_text(size = 10),
+      legend.title     = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      legend.position  = "bottom",
+      plot.margin      = margin(5.5, 16, 5.5, 5.5)
+    )
+}
+
+tbl_style <- function(x, scale_down = FALSE, full_width = FALSE, striped = TRUE) {
+  opts <- c("hold_position")
+  if (striped) {
+    opts <- c("striped", opts)
+  }
+  if (scale_down) {
+    opts <- c(opts, "scale_down")
+  }
+  x %>%
+    kable_styling(
+      latex_options = opts,
+      position = ifelse(full_width, "left", "center"),
+      font_size = TABLE_FONT_SIZE,
+      full_width = full_width
+    )
+}
+
+acc_table <- function(fc, actual, model_name, region) {
+  if (length(fc) != length(actual)) {
+    stop("Forecast and actual vectors must have the same length.")
+  }
+  e    <- actual - fc
+  mae  <- mean(abs(e))
+  rmse <- sqrt(mean(e^2))
+  mape <- mean(abs(e / actual)) * 100
+  data.frame(Region = region, Model = model_name,
+             MAE  = round(mae,  0),
+             RMSE = round(rmse, 0),
+             MAPE = round(mape, 2))
+}
+
+run_demand_experiment <- function(full_data, train_cutoff,
+                                  test_start, test_end,
+                                  region_name, K_val = 10) {
+  all_df <- full_data %>%
+    arrange(date) %>%
+    mutate(cdd_lag1 = lag(cdd, 1),
+           hdd_lag1 = lag(hdd, 1),
+           cdd_sq   = cdd^2)
+
+  train_df <- all_df %>%
+    filter(date <= train_cutoff) %>%
+    filter(complete.cases(cdd, hdd, cdd_lag1, hdd_lag1, cdd_sq, demand_daily))
+
+  test_df <- all_df %>%
+    filter(date >= test_start & date <= test_end) %>%
+    filter(complete.cases(cdd, hdd, cdd_lag1, hdd_lag1, cdd_sq, demand_daily))
+
+  weather_vars <- c("cdd", "hdd", "cdd_lag1", "hdd_lag1", "cdd_sq")
+  train_x_raw  <- as.matrix(train_df[, weather_vars])
+  test_x_raw   <- as.matrix(test_df[, weather_vars])
+
+  train_scaled <- scale(train_x_raw)
+  test_scaled  <- scale(test_x_raw,
+                        center = attr(train_scaled, "scaled:center"),
+                        scale  = attr(train_scaled, "scaled:scale"))
+
+  train_ts <- ts(train_df$demand_daily, frequency = 365.25)
+  f_train  <- fourier(train_ts, K = K_val)
+  f_test   <- fourier(train_ts, K = K_val, h = nrow(test_df))
+
+  fit <- auto.arima(
+    train_ts,
+    xreg          = cbind(f_train, train_scaled),
+    seasonal      = FALSE,
+    stepwise      = TRUE,
+    approximation = FALSE
+  )
+
+  fc    <- forecast(fit, xreg = cbind(f_test, test_scaled))
+  label <- paste0("Fourier+ARIMA+Weather (trained to ", year(train_cutoff), ")")
+  res   <- acc_table(as.numeric(fc$mean), test_df$demand_daily, label, region_name)
+
+  list(table = res,
+       model = fit,
+       fc    = fc,
+       data  = test_df %>% mutate(pred = as.numeric(fc$mean)))
+}
+```
+
+\newpage
+
+# GitHub Repository
+
+**Repository:** <https://github.com/mingjie-wei/Wei_Oh_Loo_ENV797_TSA_FinalProject>
+
+# Introduction
+
+## Motivation and Relevance
+
+The proliferation of artificial intelligence (AI) infrastructure has significantly increased electricity consumption in the United States. A single generative AI query consumes approximately ten times the energy of a conventional web search (Goldman Sachs, 2024), and aggregate query volumes now reach billions per day. Data centers, the physical backbone of AI workloads, have concentrated disproportionately in energy-abundant regions, with Texas (ERCOT grid) emerging as a primary hub driven by land availability, favorable regulatory conditions, and existing power infrastructure.
+
+Regional transmission organizations (RTOs) and grid operators rely on historically calibrated demand forecasting models to dispatch generation, procure reserves, and plan long-run capacity. If electricity demand has undergone a structural break (a sustained shift in the mean or variance of consumption that is not attributable to seasonal or weather variation), models trained on pre-break data will systematically underforecast future demand. Such underforecasting carries direct consequences for grid reliability and imposes additional costs on operators and consumers.
+
+The aim of this study is therefore to test for demand behaviour consistent with a post-November 2022 structural shift after controlling for temperature, not to claim causal identification of AI load from aggregate regional demand data alone.
+
+## Research Question and Objectives
+
+This study investigates whether the post-2022 expansion of AI infrastructure coincides with a detectable structural break in U.S. regional electricity demand, and whether the magnitude of any such break varies across grid regions with differing levels of data-center exposure.
+
+The objectives of this analysis are:
+
+1. To characterize the seasonal and trend structure of daily electricity demand in two U.S. grid regions: TEX (ERCOT) and MISO.
+2. To benchmark multiple time series forecasting models on a held-out test period.
+3. To quantify the improvement in forecast accuracy achieved by incorporating weather covariates (cooling and heating degree days).
+4. To test whether a model trained exclusively on pre-break data (frozen at November 2022) is statistically distinguishable from a model trained on more recent data, using both forecast error comparison and a formal structural break test.
+
+# Dataset Information
+
+## Data Sources
+
+Two primary data sources were used:
+
+- **EIA (U.S. Energy Information Administration):** Hourly electricity demand, demand forecast, and net generation for TEX (ERCOT) and MISO, sourced via the EIA-930 Hourly Electric Grid Monitor. For TEX, gross demand was used; for MISO, adjusted demand and adjusted net generation were used to account for interregional transfers.
+- **NOAA (National Oceanic and Atmospheric Administration):** Daily maximum (TMAX) and minimum (TMIN) temperature observations from representative airports in each region: Austin-Bergstrom International Airport, Texas, for TEX and Detroit Metro Airport, Michigan, for MISO.
+
+TEX was selected as the higher-exposure region because ERCOT has attracted a large share of recent U.S. data-center development, while MISO was used as a lower-exposure comparison region with a larger and more mature load profile. This comparison supports cross-regional interpretation, but MISO is not treated as a formal causal control.
+
+## Data Wrangling and Preprocessing
+
+```{r data-load}
+# TEX demand
+tex_raw <- read_excel("data/Region_TEX.xlsx")
+
+tex_clean <- tex_raw %>%
+  select(`Local date`, Hour, Demand, `Demand forecast`, `Net generation`) %>%
+  rename(date            = `Local date`,
+         hour            = Hour,
+         demand_mwh      = Demand,
+         demand_forecast = `Demand forecast`,
+         generation      = `Net generation`) %>%
+  mutate(date = as_date(date)) %>%
+  filter(!is.na(demand_mwh))
+
+tex_daily <- tex_clean %>%
+  group_by(date) %>%
+  summarise(demand_daily   = sum(demand_mwh,     na.rm = TRUE),
+            forecast_daily = sum(demand_forecast, na.rm = TRUE),
+            gen_daily      = sum(generation,      na.rm = TRUE),
+            .groups = "drop")
+
+# TEX weather
+tex_weather <- read_csv("data/TEX_Weather.csv", show_col_types = FALSE) %>%
+  mutate(DATE = as.Date(DATE),
+         tavg = (TMAX + TMIN) / 2,
+         cdd  = pmax(tavg - 65, 0),
+         hdd  = pmax(65 - tavg, 0)) %>%
+  group_by(DATE) %>%
+  summarise(tavg = mean(tavg, na.rm = TRUE),
+            cdd  = mean(cdd,  na.rm = TRUE),
+            hdd  = mean(hdd,  na.rm = TRUE),
+            .groups = "drop")
+
+tex_final <- tex_daily %>%
+  mutate(date = as.Date(date)) %>%
+  left_join(tex_weather, by = c("date" = "DATE")) %>%
+  filter(!is.na(tavg))
+```
+
+```{r data-load-miso}
+# MISO demand
+miso_raw <- read_excel("data/MISO.xlsx")
+
+miso_clean <- miso_raw %>%
+  select(`Local date`, Hour, `Demand forecast`,
+         `Adjusted demand`, `Adjusted net generation`) %>%
+  rename(date            = `Local date`,
+         hour            = Hour,
+         demand_mwh      = `Adjusted demand`,
+         demand_forecast = `Demand forecast`,
+         generation      = `Adjusted net generation`) %>%
+  mutate(date = as_date(date)) %>%
+  filter(!is.na(demand_mwh))
+
+miso_daily <- miso_clean %>%
+  group_by(date) %>%
+  summarise(demand_daily   = sum(demand_mwh,     na.rm = TRUE),
+            forecast_daily = sum(demand_forecast, na.rm = TRUE),
+            gen_daily      = sum(generation,      na.rm = TRUE),
+            .groups = "drop")
+
+miso_weather <- read_csv("data/MISO_Weather.csv", show_col_types = FALSE) %>%
+  mutate(DATE = as.Date(DATE),
+         tavg = (TMAX + TMIN) / 2,
+         cdd  = pmax(tavg - 65, 0),
+         hdd  = pmax(65 - tavg, 0)) %>%
+  group_by(DATE) %>%
+  summarise(tavg = mean(tavg, na.rm = TRUE),
+            cdd  = mean(cdd,  na.rm = TRUE),
+            hdd  = mean(hdd,  na.rm = TRUE),
+            .groups = "drop")
+
+miso_final <- miso_daily %>%
+  mutate(date = as.Date(date)) %>%
+  left_join(miso_weather, by = c("date" = "DATE")) %>%
+  filter(!is.na(tavg))
+```
+
+Hourly demand values were aggregated to daily totals by summing across all 24 hours for each calendar date. For NOAA weather data, daily CDD and HDD were computed as:
+
+$$\text{CDD} = \max(\bar{T} - 65,\ 0), \quad \text{HDD} = \max(65 - \bar{T},\ 0)$$
+
+where $\bar{T} = (T_{\max} + T_{\min})/2$ in degrees Fahrenheit. Days with missing weather observations were excluded from the modelling dataset.
+
+## Data Summary Table
+
+```{r data-structure-table}
+dataset_summary <- tibble(
+  Region = c("TEX (ERCOT)", "MISO"),
+  `Demand Measure` = c("Gross demand", "Adjusted demand"),
+  `Weather Station` = c("Austin-Bergstrom International Airport, TX",
+                        "Detroit Metro Airport, MI"),
+  Coverage = c(
+    paste(format(min(tex_final$date), "%Y-%m-%d"), "to", format(max(tex_final$date), "%Y-%m-%d")),
+    paste(format(min(miso_final$date), "%Y-%m-%d"), "to", format(max(miso_final$date), "%Y-%m-%d"))
+  ),
+  `Obs.` = c(nrow(tex_final), nrow(miso_final))
+)
+
+data_dictionary <- tibble(
+  Variable = c("date", "demand_daily", "forecast_daily", "gen_daily",
+               "tavg", "cdd", "hdd"),
+  Description = c(
+    "Calendar date",
+    "Observed daily electricity demand",
+    "Daily sum of EIA demand forecasts",
+    "Observed daily net generation",
+    "Average of daily TMAX and TMIN",
+    "Cooling degree days relative to 65 F",
+    "Heating degree days relative to 65 F"
+  ),
+  Units = c("Date", "MWh/day", "MWh/day", "MWh/day",
+            "Degrees F", "Degree days", "Degree days"),
+  Source = c("Merged key", "EIA-930", "EIA-930", "EIA-930",
+             "NOAA Daily Summaries", "Derived from NOAA", "Derived from NOAA")
+)
+
+dataset_summary %>%
+  kable(
+    caption = "Region-level summary of the modelling datasets used in the report.",
+    booktabs = TRUE,
+    format.args = list(big.mark = ","),
+    align = c("l", "l", "l", "c", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style(scale_down = TRUE) %>%
+  column_spec(1, width = "2.8cm", latex_valign = "m") %>%
+  column_spec(2, width = "3.0cm", latex_valign = "m") %>%
+  column_spec(3, width = "5.2cm", latex_valign = "m") %>%
+  column_spec(4, width = "4.0cm", latex_valign = "m") %>%
+  column_spec(5, width = "1.5cm", latex_valign = "m")
+```
+
+```{r data-dictionary-table}
+data_dictionary %>%
+  kable(
+    caption = "Variables retained in the daily modelling datasets, with units and sources.",
+    booktabs = TRUE,
+    align = c("l", "l", "l", "l"),
+    row.names = FALSE
+  ) %>%
+  tbl_style(scale_down = TRUE) %>%
+  column_spec(1, width = "2.4cm", latex_valign = "m") %>%
+  column_spec(2, width = "7.4cm", latex_valign = "m") %>%
+  column_spec(3, width = "2.4cm", latex_valign = "m") %>%
+  column_spec(4, width = "3.8cm", latex_valign = "m")
+```
+
+```{r data-preview-table}
+bind_rows(
+  tex_final %>% mutate(Region = "TEX (ERCOT)"),
+  miso_final %>% mutate(Region = "MISO")
+) %>%
+  group_by(Region) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  select(Region, date, demand_daily, forecast_daily, gen_daily, tavg, cdd, hdd) %>%
+  rename(Date               = date,
+         `Demand (MWh)`     = demand_daily,
+         `Forecast (MWh)`   = forecast_daily,
+         `Generation (MWh)` = gen_daily,
+         `Avg Temp (F)`     = tavg,
+         CDD                = cdd,
+         HDD                = hdd) %>%
+  mutate(across(where(is.numeric), ~round(., 1))) %>%
+  kable(
+    caption = "First five daily observations from each region's modelling dataset (10 rows total). Demand, Forecast, and Generation are daily totals in MWh; Avg Temp is the mean of TMAX and TMIN; CDD and HDD are degree-day measures relative to 65 F.",
+    booktabs = TRUE,
+    format.args = list(big.mark = ","),
+    row.names = FALSE
+  ) %>%
+  tbl_style(scale_down = TRUE)
+```
+
+## Time Series Object Construction
+
+Daily demand series were converted to `ts` objects with `frequency = 365` to approximate annual seasonality. For the weather-augmented Fourier+ARIMA models, `frequency = 365.25` was used to account for leap years. The TEX weather-merged modelling series spans `r format(min(tex_final$date), "%B %Y")` to `r format(max(tex_final$date), "%B %Y")`, while the MISO series spans `r format(min(miso_final$date), "%B %Y")` to `r format(max(miso_final$date), "%B %Y")`. Forecast horizons were therefore defined separately for each region using the number of retained observations in its own held-out year. The train/test split is described in Section 5.1.
+
+# Exploratory Analysis
+
+## Long-run Demand Trends
+
+```{r fig-monthly-trend, fig.height=5.3, fig.cap="Monthly average daily electricity demand for TEX (orange) and MISO (blue), faceted by region. The dashed vertical line marks the November 2022 breakpoint. TEX exhibits a clearer post-2022 acceleration, while MISO follows a more gradual long-run path."}
+monthly_compare <- bind_rows(
+  tex_final  %>% mutate(region = "TEX (ERCOT)"),
+  miso_final %>% mutate(region = "MISO")
+) %>%
+  mutate(region = factor(region, levels = c("TEX (ERCOT)", "MISO"))) %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(region, month) %>%
+  summarise(demand_monthly = mean(demand_daily), .groups = "drop")
+
+monthly_break_labels <- monthly_compare %>%
+  group_by(region) %>%
+  summarise(
+    x = CHATGPT_DATE + 55,
+    y = max(demand_monthly) * 0.97,
+    label = "November 2022\nbreakpoint",
+    .groups = "drop"
+  )
+
+monthly_compare %>%
+  ggplot(aes(x = month, y = demand_monthly, color = region, group = region)) +
+  geom_line(linewidth = 0.85) +
+  geom_vline(xintercept = CHATGPT_DATE, linetype = "dashed",
+             color = "grey30", linewidth = 0.6) +
+  geom_text(
+    data = monthly_break_labels,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    vjust = 1,
+    size = 3.2,
+    color = "grey30"
+  ) +
+  scale_color_manual(values = c("TEX (ERCOT)" = COL_TEX, "MISO" = COL_MISO),
+                     guide = "none") +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Avg Daily Demand (MWh)") +
+  theme_rep() +
+  facet_wrap(~region, scales = "free_y", ncol = 1) +
+  coord_cartesian(clip = "off")
+```
+
+Monthly average daily demand in TEX displays a pronounced upward shift beginning in late 2022, with summer peak values in 2023–2025 substantially exceeding those of comparable prior years. By contrast, MISO continues to exhibit strong seasonality but a flatter long-run profile. This cross-region contrast is consistent with a stronger post-2022 change in the TEX demand process, while still falling short of a causal attribution on its own.
+
+## Seasonal Structure: Day-of-Year Patterns
+
+```{r fig-doy-both, fig.height=5.2, fig.cap="Daily electricity demand by calendar day of year, smoothed by LOESS and faceted by region. Grey lines represent 2018-2022 (pre-break) years; highlighted lines represent 2023-2025 (post-break) years. TEX shows a clearer upward displacement across the year, while MISO exhibits more overlap between the two eras."}
+doy_compare <- bind_rows(
+  tex_final  %>% mutate(region = "TEX (ERCOT)"),
+  miso_final %>% mutate(region = "MISO")
+) %>%
+  mutate(
+    region = factor(region, levels = c("TEX (ERCOT)", "MISO")),
+    year   = year(date),
+    doy    = yday(date),
+    era    = ifelse(year >= 2023, "Post-break (2023-25)", "Pre-break (2018-22)"),
+    line_color = case_when(
+      era == "Pre-break (2018-22)" ~ "grey65",
+      region == "TEX (ERCOT)"      ~ COL_TEX,
+      TRUE                         ~ COL_MISO
+    ),
+    line_alpha = ifelse(era == "Pre-break (2018-22)", 0.55, 1)
+  ) %>%
+  filter(year >= 2018, year <= 2025)
+
+doy_labels <- doy_compare %>%
+  filter(era == "Post-break (2023-25)") %>%
+  group_by(region) %>%
+  summarise(
+    x = 255,
+    y = max(demand_daily) * 0.95,
+    label = "Post-break years",
+    label_color = first(line_color),
+    .groups = "drop"
+  )
+
+prebreak_labels <- doy_compare %>%
+  filter(era == "Pre-break (2018-22)") %>%
+  group_by(region) %>%
+  summarise(
+    x = 255,
+    y = quantile(demand_daily, 0.67),
+    label = "Pre-break baseline",
+    .groups = "drop"
+  )
+
+doy_compare %>%
+  ggplot(aes(x = doy, y = demand_daily, group = interaction(region, year))) +
+  geom_smooth(
+    aes(color = line_color, alpha = line_alpha),
+    method = "loess",
+    span = 0.2,
+    se = FALSE,
+    linewidth = 0.9,
+    show.legend = FALSE
+  ) +
+  geom_text(
+    data = doy_labels,
+    aes(x = x, y = y, label = label, color = label_color),
+    inherit.aes = FALSE,
+    hjust = 0,
+    fontface = "bold",
+    size = 3.1,
+    show.legend = FALSE
+  ) +
+  geom_text(
+    data = prebreak_labels,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    color = "grey45",
+    hjust = 0,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_color_identity() +
+  scale_alpha_identity() +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Day of Year", y = "Daily Demand (MWh)") +
+  theme_rep() +
+  facet_wrap(~region, scales = "free_y", ncol = 1) +
+  coord_cartesian(clip = "off")
+```
+
+The day-of-year comparison makes the cross-region contrast clearer. In TEX, post-2022 annual demand profiles are elevated relative to the pre-break baseline across much of the calendar year, not only at summer peaks. In MISO, the post-break years still overlap more substantially with the earlier range. This asymmetry is more consistent with a broader shift in TEX demand behaviour than with a purely seasonal or temperature-specific change alone.
+
+## Autocorrelation Structure
+
+```{r fig-acf-tex, fig.cap="Sample autocorrelation function (ACF) of daily TEX demand at lags up to 400 days. The characteristic U-shaped decay is a signature of a non-stationary, trend-dominated series with strong annual periodicity."}
+acf_tex <- acf(tex_final$demand_daily, lag.max = 400, plot = FALSE)
+plot(acf_tex, main = "ACF - TEX (ERCOT)",
+     col = COL_TEX, lwd = 1.5,
+     ylab = "ACF", xlab = "Lag (days)")
+```
+
+```{r fig-acf-miso, fig.cap="Sample ACF of daily MISO demand at lags up to 400 days. The cyclic pattern at the 365-day period indicates strong annual seasonality with less long-run trend distortion than TEX."}
+acf_miso <- acf(miso_final$demand_daily, lag.max = 400, plot = FALSE)
+plot(acf_miso, main = "ACF - MISO",
+     col = COL_MISO, lwd = 1.5,
+     ylab = "ACF", xlab = "Lag (days)")
+```
+
+The TEX ACF exhibits a U-shaped decay with a return toward positive values near lag 365, consistent with a non-stationary series containing both a long-run upward trend and annual seasonality. The MISO ACF displays a cleaner sinusoidal pattern with a clear 365-day cycle and less evidence of persistent trend distortion, indicating a comparatively more stable annual structure.
+
+## STL Decomposition
+
+```{r stl-compute}
+tex_ts <- ts(tex_final$demand_daily,
+             start     = c(year(min(tex_final$date)),
+                           yday(min(tex_final$date))),
+             frequency = 365)
+
+tex_stl      <- stl(tex_ts, s.window = "periodic", robust = TRUE)
+tex_trend_df <- tibble(date  = tex_final$date,
+                       trend = as.numeric(tex_stl$time.series[, "trend"]))
+```
+
+```{r stl-miso-compute}
+miso_ts <- ts(miso_final$demand_daily,
+              start     = c(year(min(miso_final$date)),
+                            yday(min(miso_final$date))),
+              frequency = 365)
+
+miso_stl      <- stl(miso_ts, s.window = "periodic", robust = TRUE)
+miso_trend_df <- tibble(date  = miso_final$date,
+                        trend = as.numeric(miso_stl$time.series[, "trend"]))
+```
+
+```{r fig-stl-combined, fig.height=5.8, fig.cap="STL trend components for TEX (orange) and MISO (blue), faceted by region. TEX exhibits a sharper post-2022 increase in the long-run trend component than MISO."}
+stl_compare <- bind_rows(
+  tex_trend_df  %>% mutate(region = "TEX (ERCOT)"),
+  miso_trend_df %>% mutate(region = "MISO")
+) %>%
+  mutate(region = factor(region, levels = c("TEX (ERCOT)", "MISO")))
+
+stl_break_labels <- stl_compare %>%
+  group_by(region) %>%
+  summarise(
+    x = CHATGPT_DATE + 70,
+    y = max(trend) * 0.99,
+    label = "November 2022 breakpoint",
+    .groups = "drop"
+  )
+
+stl_compare %>%
+  ggplot(aes(x = date, y = trend, color = region)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = CHATGPT_DATE, linetype = "dashed",
+             color = "grey30", linewidth = 0.6) +
+  geom_text(
+    data = stl_break_labels,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    vjust = 1,
+    size = 3.2,
+    color = "grey30"
+  ) +
+  scale_color_manual(values = c("TEX (ERCOT)" = COL_TEX, "MISO" = COL_MISO),
+                     guide = "none") +
+  scale_y_continuous(labels = comma) +
+  facet_wrap(~region, scales = "free_y", ncol = 1) +
+  labs(x = NULL, y = "Trend Component (MWh)") +
+  theme_rep() +
+  coord_cartesian(clip = "off")
+```
+
+The STL trend component for TEX shows a clear change in slope beginning in late 2022: prior to the November 2022 breakpoint, trend growth was gradual; after it, the trend steepens markedly. MISO also trends upward over time, but the slope change is weaker and less abrupt. The decomposition therefore supports interpreting the post-2022 shift as materially stronger in TEX than in the comparison region.
+
+# Methods and Experimental Design
+
+## Train / Test Split and "Frozen" Cutoff Design
+
+For each region, the final 365 calendar days of available data were held out as the test window. Because weather merging removes a small number of dates, the realised forecast horizon equals the number of retained observations in that window for each region. All model fitting was conducted exclusively on observations prior to the region-specific cutoff.
+
+```{r train-test-split}
+tex_split_date  <- max(tex_final$date) - 365
+miso_split_date <- max(miso_final$date) - 365
+
+tex_train <- tex_final %>% filter(date <= tex_split_date)
+tex_test  <- tex_final %>% filter(date >  tex_split_date)
+
+tex_train_ts <- ts(tex_train$demand_daily,
+                   start     = c(year(min(tex_train$date)),
+                                 yday(min(tex_train$date))),
+                   frequency = 365)
+h_tex <- nrow(tex_test)
+```
+
+```{r train-test-split-miso}
+miso_train <- miso_final %>% filter(date <= miso_split_date)
+miso_test  <- miso_final %>% filter(date >  miso_split_date)
+
+miso_train_ts <- ts(miso_train$demand_daily,
+                    start     = c(year(min(miso_train$date)),
+                                  yday(min(miso_train$date))),
+                    frequency = 365)
+h_miso <- nrow(miso_test)
+```
+
+```{r split-summary-table}
+split_summary <- bind_rows(
+  tibble(Region = "TEX (ERCOT)", Split = "Modern train",
+         Start = min(tex_train$date), End = max(tex_train$date),
+         Observations = nrow(tex_train)),
+  tibble(Region = "TEX (ERCOT)", Split = "Frozen train",
+         Start = min(tex_train$date), End = CHATGPT_DATE,
+         Observations = sum(tex_final$date <= CHATGPT_DATE)),
+  tibble(Region = "TEX (ERCOT)", Split = "Held-out test",
+         Start = min(tex_test$date), End = max(tex_test$date),
+         Observations = nrow(tex_test)),
+  tibble(Region = "MISO", Split = "Modern train",
+         Start = min(miso_train$date), End = max(miso_train$date),
+         Observations = nrow(miso_train)),
+  tibble(Region = "MISO", Split = "Frozen train",
+         Start = min(miso_train$date), End = CHATGPT_DATE,
+         Observations = sum(miso_final$date <= CHATGPT_DATE)),
+  tibble(Region = "MISO", Split = "Held-out test",
+         Start = min(miso_test$date), End = max(miso_test$date),
+         Observations = nrow(miso_test))
+)
+
+split_summary %>%
+  mutate(across(c(Start, End), ~format(., "%Y-%m-%d"))) %>%
+  kable(
+    caption = "Region-specific train/test windows used for the Modern and Frozen forecasting experiments.",
+    booktabs = TRUE,
+    format.args = list(big.mark = ","),
+    align = c("l", "l", "c", "c", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style(scale_down = TRUE)
+```
+
+A second experiment was designed to test for a post-2022 demand shift. Two variants of the Fourier+ARIMA+Weather model were trained on the same series:
+
+- **Modern model:** trained on all data up to the standard train/test split date.
+- **Frozen model:** trained only on data prior to the November 2022 breakpoint, then evaluated on the same held-out test set.
+
+November 2022 was treated as an ex ante breakpoint motivated by the public release of ChatGPT and the subsequent acceleration of discussion around generative-AI infrastructure. If the post-2022 period reflects a genuine structural change, the Frozen model should produce systematically larger forecast errors, even after controlling for weather.
+
+## Weather Control: CDD and HDD as Exogenous Regressors
+
+Electricity demand is strongly temperature-driven: cooling degree days (CDD) capture summer air-conditioning load, and heating degree days (HDD) capture winter heating load. By incorporating CDD, HDD, one-day lags of both CDD and HDD, and a quadratic CDD term (CDD$^2$) as external regressors, the model attributes a larger share of demand variation to observed climate variables. Any remaining forecast gap is therefore less likely to be purely temperature-driven, but it may still reflect multiple concurrent structural or economic changes rather than AI load alone.
+
+## Baseline Model Suite
+
+Five candidate models were evaluated on the TEX and MISO training series:
+
+1. **Seasonal Naive (SNaive):** Benchmark model; repeats the observation from the same day of the previous year.
+2. **STL + ETS:** Seasonal-Trend decomposition by LOESS followed by Exponential Smoothing on the de-seasonalised remainder.
+3. **STL + ARIMA:** STL decomposition followed by automatic ARIMA selection on the remainder.
+4. **Fourier + ARIMA (K = 10):** Dynamic harmonic regression using $K = 10$ sine/cosine Fourier pairs to model annual seasonality within an ARIMA framework, without weather covariates.
+5. **TBATS:** Trigonometric seasonality, Box-Cox transformation, ARMA errors, Trend and Seasonal decomposition.
+
+All models were estimated in R using functions from `forecast` (`snaive`, `stlf`, `auto.arima`, `fourier`, `tbats`), `stats` (`stl`), and `strucchange` (`sctest`), with `tidyverse`, `readxl`, and `lubridate` used for preprocessing and visualization.
+
+```{r baseline-models}
+snaive_tex     <- snaive(tex_train_ts, h = h_tex)
+acc_sn_tex     <- acc_table(as.numeric(snaive_tex$mean),
+                            tex_test$demand_daily, "SNaive", "TEX")
+
+stlf_tex_ets   <- stlf(tex_train_ts, h = h_tex, method = "ets",   robust = TRUE)
+acc_stlf_tex   <- acc_table(as.numeric(stlf_tex_ets$mean),
+                            tex_test$demand_daily, "STL + ETS", "TEX")
+
+stlf_tex_arima <- stlf(tex_train_ts, h = h_tex, method = "arima", robust = TRUE)
+acc_stla_tex   <- acc_table(as.numeric(stlf_tex_arima$mean),
+                            tex_test$demand_daily, "STL + ARIMA", "TEX")
+
+K_tex          <- 10
+four_train_tex <- fourier(tex_train_ts, K = K_tex)
+four_test_tex  <- fourier(tex_train_ts, K = K_tex, h = h_tex)
+fit_four_tex   <- auto.arima(tex_train_ts, xreg = four_train_tex,
+                              seasonal = FALSE, stepwise = TRUE,
+                              approximation = TRUE)
+fc_four_tex    <- forecast(fit_four_tex, xreg = four_test_tex, h = h_tex)
+acc_four_tex   <- acc_table(as.numeric(fc_four_tex$mean),
+                            tex_test$demand_daily, "Fourier + ARIMA", "TEX")
+
+tbats_tex      <- tbats(tex_train_ts, use.parallel = FALSE)
+fc_tbats_tex   <- forecast(tbats_tex, h = h_tex)
+acc_tbats_tex  <- acc_table(as.numeric(fc_tbats_tex$mean),
+                            tex_test$demand_daily, "TBATS", "TEX")
+```
+
+```{r baseline-models-miso}
+snaive_miso    <- snaive(miso_train_ts, h = h_miso)
+acc_sn_miso    <- acc_table(as.numeric(snaive_miso$mean),
+                            miso_test$demand_daily, "SNaive", "MISO")
+
+stlf_miso_ets  <- stlf(miso_train_ts, h = h_miso, method = "ets",   robust = TRUE)
+acc_stlf_miso  <- acc_table(as.numeric(stlf_miso_ets$mean),
+                            miso_test$demand_daily, "STL + ETS", "MISO")
+
+stlf_miso_arima <- stlf(miso_train_ts, h = h_miso, method = "arima", robust = TRUE)
+acc_stla_miso   <- acc_table(as.numeric(stlf_miso_arima$mean),
+                             miso_test$demand_daily, "STL + ARIMA", "MISO")
+
+K_miso          <- 10
+four_train_miso <- fourier(miso_train_ts, K = K_miso)
+four_test_miso  <- fourier(miso_train_ts, K = K_miso, h = h_miso)
+fit_four_miso   <- auto.arima(miso_train_ts, xreg = four_train_miso,
+                               seasonal = FALSE, stepwise = TRUE,
+                               approximation = TRUE)
+fc_four_miso    <- forecast(fit_four_miso, xreg = four_test_miso, h = h_miso)
+acc_four_miso   <- acc_table(as.numeric(fc_four_miso$mean),
+                             miso_test$demand_daily, "Fourier + ARIMA", "MISO")
+
+tbats_miso    <- tbats(miso_train_ts, use.parallel = FALSE)
+fc_tbats_miso <- forecast(tbats_miso, h = h_miso)
+acc_tbats_miso <- acc_table(as.numeric(fc_tbats_miso$mean),
+                            miso_test$demand_daily, "TBATS", "MISO")
+```
+
+## Fourier + ARIMA with Weather Regressors
+
+The best-performing baseline model (Fourier+ARIMA) was extended with weather regressors (CDD, HDD, CDD$_{t-1}$, HDD$_{t-1}$, CDD$^2$), standardised to zero mean and unit variance using training-set statistics. This model was estimated twice per region (once as the Modern specification and once as the Frozen specification) to operationalise the structural break experiment described in Section 5.1. For computational tractability, the baseline Fourier+ARIMA screening uses `approximation = TRUE`, whereas the final weather-augmented models use `approximation = FALSE` for a stricter ARIMA fit.
+
+# Results
+
+## Baseline Model Comparison
+
+```{r results-baseline-tex}
+results_tex <- bind_rows(acc_sn_tex, acc_stlf_tex, acc_stla_tex,
+                          acc_four_tex, acc_tbats_tex) %>%
+  arrange(MAPE)
+```
+
+```{r results-baseline-table-tex, include=FALSE}
+results_tex %>%
+  kable(
+    caption = "Baseline model performance on the TEX held-out test set. Models are ranked by MAPE (ascending). Fourier + ARIMA and STL + ARIMA achieve the joint-lowest MAPE.",
+    booktabs = TRUE,
+    col.names = c("Region", "Model", "MAE", "RMSE", "MAPE (%)"),
+    align = c("l", "l", "r", "r", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style() %>%
+  row_spec(1, bold = TRUE)
+```
+
+```{r results-baseline-table-miso}
+model_order <- c("SNaive", "STL + ETS", "STL + ARIMA", "Fourier + ARIMA", "TBATS")
+
+results_both <- bind_rows(
+  acc_sn_tex,    acc_sn_miso,
+  acc_stlf_tex,  acc_stlf_miso,
+  acc_stla_tex,  acc_stla_miso,
+  acc_four_tex,  acc_four_miso,
+  acc_tbats_tex, acc_tbats_miso
+) %>%
+  mutate(
+    Region = factor(Region, levels = c("TEX", "MISO")),
+    Model  = factor(Model, levels = model_order)
+  )
+
+results_mape_wide <- results_both %>%
+  select(Region, Model, MAPE) %>%
+  arrange(Region, Model) %>%
+  pivot_wider(names_from = Model, values_from = MAPE)
+
+results_mape_display <- results_mape_wide %>%
+  rowwise() %>%
+  mutate(best_mape = min(c_across(where(is.numeric)))) %>%
+  mutate(across(
+    where(is.numeric),
+    ~ ifelse(
+      abs(.x - best_mape) < 1e-9,
+      paste0("\\textbf{", sprintf("%.2f", .x), "}"),
+      sprintf("%.2f", .x)
+    )
+  )) %>%
+  ungroup() %>%
+  select(-best_mape)
+
+results_detail <- results_both %>%
+  arrange(Region, Model) %>%
+  select(Region, Model, MAE, RMSE)
+```
+
+```{r results-baseline-values, include=FALSE}
+best_tex_mape <- results_both %>%
+  filter(Region == "TEX") %>%
+  summarise(best = min(MAPE)) %>%
+  pull(best)
+
+best_miso_mape <- results_both %>%
+  filter(Region == "MISO") %>%
+  summarise(best = min(MAPE)) %>%
+  pull(best)
+```
+
+```{r results-baseline-table-mape}
+results_mape_display %>%
+  kable(
+    format = "latex",
+    caption = "Baseline MAPE (\\%) comparison across TEX and MISO. Bold values indicate the lowest regional MAPE.",
+    booktabs = TRUE,
+    escape = FALSE,
+    col.names = c("Region", "SNaive", "STL + ETS", "STL + ARIMA",
+                  "Fourier + ARIMA", "TBATS"),
+    align = c("l", "r", "r", "r", "r", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style(scale_down = TRUE)
+```
+
+```{r results-baseline-table-secondary}
+results_detail %>%
+  kable(
+    caption = "Secondary baseline error metrics for the held-out test set. MAE and RMSE are reported to complement, rather than replace, the MAPE ranking above.",
+    booktabs = TRUE,
+    format.args = list(big.mark = ","),
+    col.names = c("Region", "Model", "MAE", "RMSE"),
+    align = c("l", "l", "r", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style() %>%
+  collapse_rows(columns = 1, latex_hline = "major")
+```
+
+On TEX, Fourier+ARIMA and STL+ARIMA achieved the joint-lowest MAPE (`r sprintf("%.2f", best_tex_mape)`%), while on MISO Fourier+ARIMA was the single best baseline model (`r sprintf("%.2f", best_miso_mape)`%). We therefore carry Fourier+ARIMA forward because it is best or tied-best across both regions and extends naturally to exogenous weather regressors through dynamic harmonic regression. STL+ETS performs notably worse in both regions, indicating that simple smoothing of the de-seasonalised remainder is less effective than explicitly modelling annual harmonics and serial dependence.
+
+## Effect of Weather Control on Forecast Accuracy
+
+```{r weather-experiment}
+tex_split_modern <- tex_split_date
+
+tex_modern <- run_demand_experiment(
+  full_data    = tex_final,
+  train_cutoff = tex_split_modern,
+  test_start   = tex_split_modern + 1,
+  test_end     = max(tex_final$date),
+  region_name  = "TEX"
+)
+```
+
+```{r weather-experiment-miso}
+miso_split_modern <- miso_split_date
+
+miso_modern <- run_demand_experiment(
+  full_data    = miso_final,
+  train_cutoff = miso_split_modern,
+  test_start   = miso_split_modern + 1,
+  test_end     = max(miso_final$date),
+  region_name  = "MISO"
+)
+```
+
+```{r weather-tex-inline}
+pct_improvement_tex <- round(
+  (acc_four_tex$MAPE - tex_modern$table$MAPE) / acc_four_tex$MAPE * 100, 1)
+pct_improvement_miso <- round(
+  (acc_four_miso$MAPE - miso_modern$table$MAPE) / acc_four_miso$MAPE * 100, 1)
+```
+
+Adding CDD, HDD, their one-day lags, and a quadratic CDD term reduced forecast MAPE by `r pct_improvement_tex`% in TEX (from `r acc_four_tex$MAPE`% to `r tex_modern$table$MAPE`%) and by `r pct_improvement_miso`% in MISO (from `r acc_four_miso$MAPE`% to `r miso_modern$table$MAPE`%). These gains show that observed temperature explains a substantial share of short-run demand variation in both regions, especially TEX. At the same time, weather adjustment does not by itself identify the source of the remaining error; it simply makes the subsequent Frozen-versus-Modern comparison more conservative.
+
+```{r weather-improvement-table}
+weather_comparison <- bind_rows(
+  acc_four_tex  %>% mutate(Specification = "Without weather"),
+  tex_modern$table %>% mutate(Specification = "With weather"),
+  acc_four_miso %>% mutate(Specification = "Without weather"),
+  miso_modern$table %>% mutate(Specification = "With weather")
+) %>%
+  select(Region, Specification, MAPE) %>%
+  pivot_wider(names_from = Specification, values_from = MAPE) %>%
+  mutate(`MAPE Reduction (%)` = round(
+    (`Without weather` - `With weather`) / `Without weather` * 100, 1))
+
+weather_comparison %>%
+  kable(
+    caption = "Effect of adding weather regressors (CDD, HDD and lags) on MAPE. The reduction is larger in TEX, indicating that temperature controls are particularly important for that region over the held-out period.",
+    booktabs = TRUE,
+    col.names = c("Region", "Fourier+ARIMA MAPE (%)",
+                  "Fourier+ARIMA+Weather MAPE (%)", "Reduction (%)"),
+    align = c("l", "r", "r", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style()
+```
+
+## Frozen vs. Modern: Structural Break Evidence
+
+```{r frozen-experiment}
+cutoff_2022 <- as.Date("2022-11-01")
+
+tex_frozen <- run_demand_experiment(
+  full_data    = tex_final,
+  train_cutoff = cutoff_2022,
+  test_start   = tex_split_modern + 1,
+  test_end     = max(tex_final$date),
+  region_name  = "TEX"
+)
+
+tex_mape_ratio <- round(tex_frozen$table$MAPE / tex_modern$table$MAPE, 1)
+```
+
+```{r frozen-experiment-miso}
+miso_frozen <- run_demand_experiment(
+  full_data    = miso_final,
+  train_cutoff = cutoff_2022,
+  test_start   = miso_split_modern + 1,
+  test_end     = max(miso_final$date),
+  region_name  = "MISO"
+)
+
+miso_mape_ratio <- round(miso_frozen$table$MAPE / miso_modern$table$MAPE, 1)
+```
+
+In TEX, the Frozen model (trained only on pre-November 2022 data) produces a MAPE of `r tex_frozen$table$MAPE`%, compared with `r tex_modern$table$MAPE`% for the Modern model, a `r tex_mape_ratio`x increase in forecast error. MISO also deteriorates, from `r miso_modern$table$MAPE`% to `r miso_frozen$table$MAPE`%, but the increase is smaller (`r miso_mape_ratio`x). Because both specifications use identical weather regressors, these gaps are not driven by different temperature controls. Instead, they indicate that pre-break demand relationships generalise much worse in TEX than in MISO, which is consistent with a stronger post-2022 shift in TEX demand behaviour.
+
+```{r frozen-comparison-table}
+frozen_comparison <- bind_rows(
+  tex_modern$table  %>% mutate(Specification = "Modern"),
+  tex_frozen$table  %>% mutate(Specification = "Frozen (pre-2022)"),
+  miso_modern$table %>% mutate(Specification = "Modern"),
+  miso_frozen$table %>% mutate(Specification = "Frozen (pre-2022)")
+) %>%
+  select(Region, Specification, MAE, RMSE, MAPE)
+```
+
+```{r fig-frozen-mape, fig.height=4.1, fig.cap="MAPE comparison for the Modern and Frozen Fourier+ARIMA+Weather models on the same held-out test set. The performance gap is much larger in TEX, where the Frozen specification underperforms sharply relative to the Modern model."}
+frozen_mape_plot_data <- frozen_comparison %>%
+  select(Region, Specification, MAPE) %>%
+  mutate(
+    Specification = recode(Specification, "Frozen (pre-2022)" = "Frozen"),
+    plot_label = factor(
+      paste(Specification, Region, sep = "\n"),
+      levels = c("Modern\nMISO", "Frozen\nMISO", "Modern\nTEX", "Frozen\nTEX")
+    )
+  )
+
+ggplot(frozen_mape_plot_data, aes(x = plot_label, y = MAPE, fill = plot_label)) +
+  geom_col(width = 0.72) +
+  geom_text(
+    aes(label = sprintf("%.2f%%", MAPE)),
+    vjust = -0.35,
+    size = 3.4,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Modern\nMISO" = "#A8D1E9",
+      "Frozen\nMISO" = COL_MISO,
+      "Modern\nTEX"  = "#F6C8A3",
+      "Frozen\nTEX"  = COL_TEX
+    ),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    labels = label_number(accuracy = 1),
+    expand = expansion(mult = c(0, 0.1))
+  ) +
+  labs(x = NULL, y = "MAPE (%)") +
+  theme_rep()
+```
+
+```{r frozen-comparison-table-display}
+frozen_comparison %>%
+  kable(
+    caption = "Forecast performance of the Modern vs. Frozen Fourier+ARIMA+Weather models on the same held-out test set. The Frozen model degrades in both regions, but the deterioration is markedly larger in TEX.",
+    booktabs = TRUE,
+    format.args = list(big.mark = ","),
+    col.names = c("Region", "Specification", "MAE", "RMSE", "MAPE (%)"),
+    align = c("l", "l", "r", "r", "r"),
+    row.names = FALSE
+  ) %>%
+  tbl_style() %>%
+  collapse_rows(columns = 1, latex_hline = "major")
+```
+
+## Residual Analysis
+
+```{r residual-data-prep}
+comparison_data <- bind_rows(
+  tex_modern$data  %>% mutate(model_type = "Modern",            region = "TEX"),
+  tex_frozen$data  %>% mutate(model_type = "Frozen (pre-2022)", region = "TEX"),
+  miso_modern$data %>% mutate(model_type = "Modern",            region = "MISO"),
+  miso_frozen$data %>% mutate(model_type = "Frozen (pre-2022)", region = "MISO")
+) %>%
+  mutate(region = factor(region, levels = c("TEX", "MISO"))) %>%
+  mutate(residual = demand_daily - pred)
+```
+
+```{r fig-residual-density, fig.height=4, fig.cap="Residual density for the Modern and Frozen Fourier+ARIMA+Weather models on the held-out test set. A rightward shift in the Frozen model distribution indicates systematic underprediction. The shift is pronounced in TEX and smaller, though still visible, in MISO."}
+ggplot(comparison_data, aes(x = residual, fill = model_type)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.6) +
+  scale_fill_manual(values = c("Modern"            = "steelblue",
+                                "Frozen (pre-2022)" = "tomato"),
+                    name = NULL) +
+  scale_x_continuous(labels = comma, n.breaks = 4) +
+  facet_wrap(~region, scales = "free") +
+  labs(x = "Residual: Actual minus Predicted (MWh)", y = "Density") +
+  theme_rep()
+```
+
+```{r fig-residual-trend, fig.height=4, fig.cap="Smoothed residual trends over the test period for Modern and Frozen models, faceted by region. Persistent positive residuals in the Frozen-TEX series indicate consistent underprediction, while MISO shows a weaker but still positive Frozen-model bias."}
+ggplot(comparison_data, aes(x = date, y = residual, color = model_type)) +
+  geom_smooth(method = "gam", se = TRUE, linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  scale_color_manual(values = c("Modern"            = "steelblue",
+                                 "Frozen (pre-2022)" = "tomato"),
+                     name = NULL) +
+  scale_y_continuous(labels = comma) +
+  facet_wrap(~region, scales = "free_y") +
+  labs(x = NULL, y = "Residual: Actual minus Predicted (MWh)") +
+  theme_rep()
+```
+
+The residual density and trend plots provide visual confirmation of the asymmetry between regions. In TEX, the Frozen model produces a residual distribution shifted substantially to the right of zero, reflecting systematic underprediction across the test period. In MISO, the Frozen model also underpredicts on average, but the rightward shift is smaller and the residual paths remain closer together. The residual evidence therefore supports a relative statement: both regions evolve after 2022, but the mismatch between pre-break expectations and realised demand is materially larger in TEX.
+
+## Formal Structural Break Test
+
+```{r chow-test}
+tex_residuals <- residuals(tex_modern$model)
+
+tex_train_dates <- tex_final %>%
+  filter(date <= tex_split_modern) %>%
+  arrange(date) %>%
+  mutate(cdd_lag1 = lag(cdd, 1), hdd_lag1 = lag(hdd, 1), cdd_sq = cdd^2) %>%
+  filter(complete.cases(cdd, hdd, cdd_lag1, hdd_lag1, cdd_sq, demand_daily))
+
+break_idx    <- which(tex_train_dates$date >= CHATGPT_DATE)[1]
+chow_result  <- sctest(tex_residuals ~ 1, type = "Chow", point = break_idx)
+```
+
+```{r chow-miso}
+miso_residuals <- residuals(miso_modern$model)
+
+miso_train_dates <- miso_final %>%
+  filter(date <= miso_split_modern) %>%
+  arrange(date) %>%
+  mutate(cdd_lag1 = lag(cdd, 1), hdd_lag1 = lag(hdd, 1), cdd_sq = cdd^2) %>%
+  filter(complete.cases(cdd, hdd, cdd_lag1, hdd_lag1, cdd_sq, demand_daily))
+
+miso_break_idx <- which(miso_train_dates$date >= CHATGPT_DATE)[1]
+chow_miso      <- sctest(miso_residuals ~ 1, type = "Chow", point = miso_break_idx)
+```
+
+```{r chow-table, include=FALSE}
+chow_df <- data.frame(
+  Region      = "TEX",
+  F_stat      = round(unname(chow_result$statistic), 3),
+  p_value     = format.pval(chow_result$p.value, digits = 3),
+  Conclusion  = ifelse(chow_result$p.value < 0.05,
+                       "Reject H0 (break detected)",
+                       "Fail to reject H0")
+)
+
+chow_df %>%
+  kable(
+    caption = "Chow test for a structural break in the Modern model residuals at the November 2022 breakpoint.",
+    booktabs = TRUE,
+    col.names = c("Region", "F Statistic", "p-value", "Conclusion"),
+    align = c("l", "r", "r", "l"),
+    row.names = FALSE
+  ) %>%
+  tbl_style()
+```
+
+```{r chow-table-miso}
+chow_df_full <- bind_rows(
+  tibble(
+    Region     = "TEX",
+    F_stat     = round(unname(chow_result$statistic), 3),
+    p_value    = format.pval(chow_result$p.value, digits = 3),
+    Conclusion = ifelse(chow_result$p.value < 0.05,
+                        "Reject H0 (break detected)",
+                        "Fail to reject H0")
+  ),
+  tibble(
+    Region     = "MISO",
+    F_stat     = round(unname(chow_miso$statistic), 3),
+    p_value    = format.pval(chow_miso$p.value, digits = 3),
+    Conclusion = ifelse(chow_miso$p.value < 0.05,
+                        "Reject H0 (break detected)",
+                        "Fail to reject H0")
+  )
+)
+
+chow_df_full %>%
+  kable(
+    caption = "Chow test results for TEX and MISO at the November 2022 breakpoint.",
+    booktabs = TRUE,
+    col.names = c("Region", "F Statistic", "p-value", "Conclusion"),
+    align = c("l", "r", "r", "l"),
+    row.names = FALSE
+  ) %>%
+  tbl_style()
+```
+
+```{r residual-diagnostics-values, include=FALSE}
+lb_tex  <- Box.test(residuals(tex_modern$model), lag = 30, type = "Ljung-Box")
+lb_miso <- Box.test(residuals(miso_modern$model), lag = 30, type = "Ljung-Box")
+```
+
+The Chow test evaluates whether the mean level of the Modern model residuals changes at the November 2022 breakpoint. The results do not reach conventional significance in either region: TEX yields F = `r round(chow_result$statistic, 3)`, p = `r round(chow_result$p.value, 3)`, and MISO yields F = `r round(chow_miso$statistic, 3)`, p = `r round(chow_miso$p.value, 3)`. These findings support the professor's caution that unexplained residual variation should not be treated as stand-alone proof of an AI-driven break. In this report, the stronger evidence comes from the out-of-sample Frozen-versus-Modern comparison: models trained only on pre-break data deteriorate in both regions, but far more sharply in TEX. Alternative concurrent drivers of this gap, including industrial expansion, population growth, and electric vehicle adoption, cannot be excluded on the basis of time-series evidence alone.
+
+# Summary and Conclusions
+
+## Key Findings
+
+This study examined whether the rapid expansion of AI data-center infrastructure since late 2022 coincides with a detectable structural break in U.S. regional electricity demand, using daily EIA demand data and NOAA weather observations for TEX (ERCOT) and MISO.
+
+Three principal findings emerge:
+
+1. **Fourier+ARIMA is the most reliable baseline specification across regions.** A dynamic harmonic regression model with $K = 10$ Fourier pairs and automatic ARIMA error structure achieved the lowest MAPE in MISO and tied for the lowest MAPE in TEX, outperforming or matching SNaive, STL+ETS, STL+ARIMA, and TBATS.
+
+2. **Weather control materially improves forecast accuracy in both regions, especially TEX.** Incorporating CDD, HDD, their lags, and a quadratic CDD term reduced MAPE by approximately `r pct_improvement_tex`% in TEX and `r pct_improvement_miso`% in MISO. Weather adjustment is therefore essential for fair comparison, but it does not uniquely identify the source of the remaining error.
+
+3. **The Frozen model degrades much more sharply in TEX than in MISO.** A Fourier+ARIMA+Weather model trained exclusively on pre-November 2022 data produces a `r tex_mape_ratio`x larger MAPE than the Modern model in TEX, compared with a `r miso_mape_ratio`x increase in MISO. Both the forecast error gap and the residual plots indicate that pre-break demand relationships generalise much worse in TEX. The Chow tests on Modern-model residuals do not reach conventional significance in either region, so the evidence is best interpreted as consistent with a stronger post-2022 shift in TEX rather than as formal causal proof of an AI-driven break.
+
+Taken together, the results suggest that post-2022 demand behaviour changed more strongly in TEX than in the comparison region. Texas's grid appears to be operating under a higher recent demand baseline that models calibrated on pre-break data capture poorly, but the observational design does not isolate AI infrastructure as the sole driver of that shift.
+
+## Limitations
+
+- **Attribution gap.** Time series methods identify changing forecast relationships but cannot isolate their causal drivers. Other concurrent factors, including semiconductor fabrication plants, population growth, and EV adoption, may contribute to the TEX demand shift. Disaggregated metering data at the data-center level would be required for causal attribution.
+- **Residual autocorrelation.** Ljung-Box tests on the Modern-model residuals reject white-noise errors in both TEX and MISO (`p < 0.001` in each case), suggesting that unobserved economic or infrastructure variables are not fully captured by the current specification.
+- **Single-station weather proxy.** Each region is represented by a single airport weather station. Spatial heterogeneity in temperature within large grid footprints is not captured.
+- **Daily temporal resolution.** Aggregating to daily demand conceals intraday load profiles. Data centers likely impose a relatively flat, 24-hour load contribution; this signature would be most visible in hourly, especially overnight, consumption data.
+- **Comparison-region ambiguity.** MISO serves as a useful lower-exposure comparison region, but it is not a no-growth counterfactual. The weaker MISO shift may reflect a combination of geographic dilution, broader regional growth, and model misspecification rather than a true absence of post-2022 change.
+
+## Future Work
+
+- Incorporate hourly-resolution demand data to isolate the overnight load floor, which is most likely to reflect the continuous, non-weather-sensitive load profile of data centers.
+- Apply the Bai-Perron multiple breakpoint test to endogenously identify the timing and number of structural breaks, rather than imposing the November 2022 date a priori.
+- Extend the model with economic covariates (industrial production indices, GDP growth) to reduce residual autocorrelation and improve causal attribution.
+- Apply the same framework to additional high-exposure grids (e.g., PJM Northern Virginia zone) to test whether the TEX finding generalises.
+
+# References and AI Use Disclosure
+
+## References
+
+- National Oceanic and Atmospheric Administration (NOAA). (2026). *Daily Summaries dataset*.
+- Goldman Sachs. (2024). *AI is poised to drive 160% increase in data center power demand*. Goldman Sachs Equity Research.
+- Hyndman, R. J., & Athanasopoulos, G. (2021). *Forecasting: Principles and Practice* (3rd ed.). OTexts. <https://otexts.com/fpp3/>
+- Lawrence Berkeley National Laboratory (LBNL). (2024). *United States Data Center Energy Usage Report*. U.S. Department of Energy.
+- R Core Team. (2024). *R: A Language and Environment for Statistical Computing*. R Foundation for Statistical Computing.
+- U.S. Energy Information Administration (EIA). (2026). *EIA-930 Hourly Electric Grid Monitor*.
+- Zeileis, A., Leisch, F., Hornik, K., & Kleiber, C. (2002). strucchange: An R package for testing for structural change in linear regression models. *Journal of Statistical Software*, 7(2), 1-38.
+
+## AI Use Disclosure
+
+Large language models (Claude, ChatGPT) were used to assist with report structure, code organisation, and language revision. All modelling decisions, parameter choices, analytical interpretations, and conclusions were developed and verified by the authors.
